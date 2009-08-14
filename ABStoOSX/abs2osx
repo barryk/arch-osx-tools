@@ -8,17 +8,30 @@ use strict;
 use Getopt::Long;
 
 my $inplace = '';
-GetOptions('--inplace', \$inplace);
+my $checkout = '';
+GetOptions('--inplace' => \$inplace,
+           '--checkout' => \$checkout); 
 
 my $ver = "0.2";
 
 if ($#ARGV < 0) {
     print "Usage: $0 /path/to/PKGBUILD > /path/to/new/PKGBUILD\n";
-    print "   or: $0 --inplace /path/to/PKGBUILD\n"; 
+    print "   or: $0 --inplace /path/to/PKGBUILD\n";
+    print "   or: $0 --checkout pacman\n";
+    print "       Check package out from svn://archlinux and converts\n";
     exit 0;
 }
+my $filepath;
 
-my $filepath = $ARGV[0];
+if ($checkout) {
+    my $pkg = $ARGV[0];
+    die "Invalid package name" if $pkg =~ m![/ ]!;
+    system ("svn co svn://archlinux.org/srv/svn-packages/$pkg/trunk $pkg");
+    $filepath = "$pkg/PKGBUILD";
+    $inplace = 1;
+} else {
+    $filepath = $ARGV[0];
+}
 
 my $outbuffer =  "# PKGBUILD autocreated by ABStoOSX $ver\n# \$Id\n";
 
