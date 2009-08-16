@@ -1,68 +1,292 @@
-#!/usr/bin/perl
-# ABStoOSX is a (limited) script that will translate an ABS PKGBUILD into one
-# that can be used on arch-osx.
-# This script changes the common needs, but is by no means complete. A human is
-# still needed to manually confirm the output of this script.
+#!/usr/bin/env perl
+
+# ABStoOSX is a script to:
+#   Prepare PKGBUILD files written for Archlinux (ABS) for arch-osx
+#   Checkout and update packages from Archlinux's repository and prepare them
+#   for arch-osx
+#
+# This script changes the common gotchas, but still requires a human to verify
+# the output.
 
 use strict;
+use warnings;
 use Getopt::Long;
+use SVN::Client;
+use File::Path;
 
-my $inplace = '';
-my $checkout = '';
-GetOptions('--inplace' => \$inplace,
-           '--checkout' => \$checkout); 
+my $svn_ctx = new SVN::Client();
 
-my $ver = "0.2";
+my ($_checkout, $_update, $_revision);
+GetOptions('checkout' => \$_checkout,
+           'update' => \$_update,
+           'revision=i' => \$_revision,); 
 
-if ($#ARGV < 0) {
-    print "Usage: $0 /path/to/PKGBUILD > /path/to/new/PKGBUILD\n";
-    print "   or: $0 --inplace /path/to/PKGBUILD\n";
-    print "   or: $0 --checkout pacman\n";
-    print "       Check package out from svn://archlinux and converts\n";
+my $VERSION = "0.5";
+
+if ($#ARGV < 0 && !$_update) {
+    print "Usage: $0 /path/to/PKGBUILD\n";
+    print "   or: $0 --checkout [--revision 123] pacman\n";
+    print "   or: $0 --update [--revision 123] pacman\n";
+    print "       Checkout/update package from svn://archlinux and convert\n";
     exit 0;
 }
-my @files;
 
-if ($checkout) {
+if ($_checkout) {
     my $pkg = $ARGV[0];
-    die "Invalid package name" if $pkg =~ m![/ ]!;
-    system ("svn co svn://archlinux.org/srv/svn-packages/$pkg/trunk $pkg");
-    push @files, "$pkg/PKGBUILD";
-    push @files, "$pkg/$pkg.install" if -e "$pkg/$pkg.install";
-    $inplace = 1;
+    my $desired_revision = $_revision || 'HEAD';
+    die 'Invalid package name' if $pkg =~ m![/ ]!;
+    
+    my $repo = "svn://archlinux.org/srv/svn-packages/$pkg/trunk";
+    
+    my $revision = $svn_ctx->export($repo, $pkg, $desired_revision, 0);
+    die "SVN Export of $repo failed" unless $revision;
+    die "No PKGBUILD in export" if not -e "$pkg/PKGBUILD";
+    die "Could not fetch specified $_revision, got $revision"
+        if $_revision and $_revision ne $revision;
+
+    WriteFile("$pkg/.archlinux_svnrevision",
+              "$repo $revision\n", { overwrite => 0 });
+
+    ConvertFileToArchOSX("$pkg/PKGBUILD", { PKGBUILD => 1, inplace => 1 });
+    ConvertFileToArchOSX("$pkg/$pkg.install", { inplace => 1 })
+        if -e "$pkg/$pkg.install";
+
+} elsif ($_update) {
+    my $pkg_dir = '.';
+    my $desired_revision = $_revision || 'HEAD';
+    my $updated_to_revision;
+
+    $pkg_dir = $ARGV[0]
+        if @ARGV;
+
+    chdir $pkg_dir;
+
+    # Get the last checkout information 
+    my $archlinux_svnrevision = ReadFile(".archlinux_svnrevision")
+        or die "Could not read .archlinux_svnrevision information";
+    chomp $archlinux_svnrevision;
+    my ($repo, $last_revision) = split(/ /, $archlinux_svnrevision);
+    
+    my $svn_info = SVNInfo($repo, $desired_revision);
+    if ($svn_info->rev <= $last_revision) {
+        my $downgrade = 0;
+        if ($desired_revision ne 'HEAD' and
+            $svn_info->rev < $last_revision)
+        {
+            $downgrade = WarnPrompt(
+                "Desired revision ($desired_revision) is older than " .
+                "current revision ($last_revision). \n" .
+                "Do you really want to downgrade?", 'noyes');
+        }
+        if (!$downgrade) {
+            warn "Already up to date (have $last_revision).\n";
+            exit(0);
+        }
+    }
+
+    $svn_ctx->export($repo, 'abs2osx.ORIGIN', $last_revision, 0);
+    $updated_to_revision = $svn_ctx->export($repo, "abs2osx.$desired_revision",
+                                            $desired_revision, 0);
+    
+    ConvertFileToArchOSX("abs2osx.ORIGIN/PKGBUILD",
+        { PKGBUILD => 1, inplace => 1 });
+    # Get the latest from SVN
+
+    ConvertFileToArchOSX("abs2osx.$desired_revision/PKGBUILD",
+        { PKGBUILD => 1, inplace => 1 });
+
+    # For files that exit in MINE, diff3 with ORIGIN and HEAD
+    opendir(DIR, $pkg_dir);
+    while (my $entry = readdir DIR) {
+        next if $entry =~ /^\./; # Skip dot files
+        next if $entry =~ /abs2osx/; # Skip our own files
+        next if not -f "abs2osx.ORIGIN/$entry"; # Skip non-origin files
+        
+        my $conflicts =
+            Diff3($entry,
+                  "abs2osx.ORIGIN/$entry",
+                  "abs2osx.$desired_revision/$entry");
+
+        if ($conflicts) {
+            warn "Merged $entry WITH CONFLICTS. " .
+                 "Please edit the file to manually resolve\n";
+        } else {
+            warn "Merged $entry without conflict.\n";
+        }
+    }
+    closedir(DIR);
+
+    # Copy any new files between ORIGIN and HEAD to MINE
+    opendir(DIR, "abs2osx.$desired_revision");
+    while (my $entry = readdir DIR) {
+        if (not -e "abs2osx.ORIGIN/$entry" and
+            not -e $entry)
+        {
+            # If it is new to ORIGIN and MINE, move directly from HEAD,
+            # as it was skipped by the diff3 step
+            #
+            # If it is new to MINE, but not ORIGIN, we deleted it
+            # intentionally, so continue ignoring it.
+            rename "abs2osx.$desired_revision/$entry", "$entry";
+        }
+    }
+    closedir(DIR);
+
+    # Save state for next update
+    WriteFile(".archlinux_svnrevision",
+              "$repo $updated_to_revision\n", { overwrite => 1 } );
+
+    # Cleanup
+    rmtree 'abs2osx.ORIGIN';
+    rmtree "abs2osx.$desired_revision";
+
 } else {
-    @files = @ARGV;
+    foreach my $file (@ARGV) {
+        my $params = { create_diff => 0,
+                       inplace => 1 };
+        $params->{PKGBUILD} = 1 if $file =~ /PKGBUILD/; 
+        ConvertFileToArchOSX($file, $params);
+    }
 }
 
-foreach my $filepath (@files) {
+sub ConvertFileToArchOSX {
+    my $infile = shift;
+    my $params = shift;
     my $outbuffer = '';
+    
+    my $outfile = $infile . ".abs2osx";
 
-    if ($filepath =~ /PKGBUILD/) {
-        $outbuffer .=  "# PKGBUILD autocreated by ABStoOSX $ver\n# \$Id\n";
+    die "Output file $outfile already exists"
+        if -e $outfile;
+
+    open(ORIG, "<$infile")
+        or die "Could not read from $infile";
+
+    open(NEW, ">$outfile")
+        or die "Could not write to $outfile";
+    
+    print NEW "# PKGBUILD autoconverted by ABStoOSX $VERSION\n"
+        if ($params->{PKGBUILD});
+
+
+    while (my $line=<ORIG>) {
+        my ($new_line) = ConvertLineToArchOSX($line);
+        print NEW $new_line;
     }
 
-    open(F, "<$filepath");
-    while(<F>) {
-        s/^#\s*Maintainer/# ArchLinux Maintainer/;
-        next if(/^# \$Id/); # Delete because we will generate our own
-        s/arch=\(.*?\)/arch=('macx86')/;
-        if(/^depends/)  {
-            s/\s*'glibc'\s*/ /;
+    close(ORIG);
+    close(NEW);
+    
+    system("diff \"$infile\" \"$outfile\" > \"${infile}.abs2osx.patch\"")
+        if ($params->{create_diff});
+
+    rename $outfile, $infile
+        if ($params->{inplace});
+}
+
+# Converts single line of PKGBUILD or .install from arch-linux into opt-arch
+sub ConvertLineToArchOSX {
+    $_ = shift;
+
+    s/^#\s*Maintainer/# ArchLinux Maintainer/;
+    s/arch=\(.*?\)/arch=('macx86')/;
+    s/ \$Id:.*\$/ \$Id\$/; # We can't have expanded SVN Ids if we want good merges
+    /^depends=/ && s/\s*'(glibc|gcc-libs)'\s*/ /;
+
+    s^/usr^/opt/arch^g;
+    s^usr/^opt/arch/^g;
+    s^/etc^/opt/arch/etc^g;
+    s^(\s)etc^$1opt/arch/etc^g;
+    s^/var^/opt/arch/var^g;
+    s^--strip-debug^-S^g;
+
+    return $_;
+}
+
+sub SVNInfo {
+    my $repo = shift;
+    my $revision = shift;
+    my $info;
+
+    $svn_ctx->info($repo, undef, $revision,
+        sub { my ($path, $info_local, $pool) = @_;
+              $info = $info_local;
+              },
+        0);
+    
+    return $info;
+}
+
+sub Diff3 {
+    my ($mine, $origin, $head) = @_;
+    
+    -e $mine   or die "Cannot diff3 with no MINE";
+    -e $origin or $origin = "/dev/null";
+    -e $head   or $head   = "/dev/null";
+
+    my $out = `diff3 -m  "$mine" "$origin" "$head"`;
+    my $diff3_ret = $? >> 8;
+    
+    WriteFile($mine, $out, { overwrite => 1 });
+
+    return $diff3_ret;
+}   
+
+sub WriteFile {
+    my $filename = shift;
+    my $content = shift;
+    my $params = shift;
+
+    die "Cannot write file $filename as it already exists"
+        if -e $filename  and not $params->{overwrite};
+
+    open(F, ">$filename");
+    print F $content;
+    close F;
+}
+
+sub ReadFile {
+    my $filename = shift;
+    my $params = shift;
+    
+    local $/ = undef;
+    open(F, "<$filename") or return undef;
+    my $content = <F>;
+    close F;
+
+    return $content;
+}
+
+sub WarnPrompt {
+    my $prompt = shift;
+    my $choices = shift;
+    my $params = shift;
+
+    my $default_choice;
+    
+    if ($choices eq 'noyes') {
+        $default_choice = 0;
+        $prompt .= " [N/y]";
+    } elsif($choices eq 'yesno') {
+        $default_choice = 1;
+        $prompt .= " [Y/n]";
+    } else {
+        $prompt .= " [y/n]";
+    }
+    my $choice;
+    
+    while (!defined($choice)) {
+        print STDERR "$prompt ";
+        my $choice_txt = <STDIN>;
+        chomp $choice_txt;
+        if ($choice_txt eq '') {
+            $choice = $default_choice;
+        } elsif ($choice_txt =~ /^y(es)?/i) {
+            $choice = 1;
+        } elsif ($choice_txt =~ /^n(o)?/i) {
+            $choice = 0;
         }
-        s^/usr^/opt/arch^g;
-        s^usr/^opt/arch/^g;
-        s^/etc^/opt/arch/etc^g;
-        s^/var^/opt/arch/var^g;
-        s^--strip-debug^-S^g;
-        if ($inplace) {
-            $outbuffer .= $_;
-        }
     }
-    close(F);
 
-    if ($inplace) {
-        open(F, ">$filepath");
-        print F $outbuffer;
-        close(F);
-    }
+    return $choice;
 }
