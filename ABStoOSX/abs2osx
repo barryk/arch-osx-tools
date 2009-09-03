@@ -36,7 +36,7 @@ if ($_checkout) {
     my $desired_revision = $_revision || 'HEAD';
     die 'Invalid package name' if $pkg =~ m![/ ]!;
     
-    my $repo = "svn://archlinux.org/srv/svn-packages/$pkg/trunk";
+    my $repo = "svn://archlinux.org/packages/$pkg/trunk";
     
     my $revision = $svn_ctx->export($repo, $pkg, $desired_revision, 0);
     die "SVN Export of $repo failed" unless $revision;
